@@ -33,11 +33,7 @@
 #include <click/cxxprotect.h>
 CLICK_CXX_PROTECT
 #include <linux/mutex.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
-# include <linux/namei.h>
-#else
-# include <linux/locks.h>
-#endif
+#include <linux/namei.h>
 #include <linux/proc_fs.h>
 CLICK_CXX_UNPROTECT
 #include <click/cxxunprotect.h>
@@ -51,9 +47,7 @@ static struct inode_operations *click_handler_inode_ops;
 static struct dentry_operations click_dentry_ops;
 static struct proclikefs_file_system *clickfs;
 
-static struct mutex clickfs_lock, click_ino_lock;
-static wait_queue_head_t clickfs_waitq;
-static atomic_t clickfs_read_count;
+static struct mutex clickfs_lock;
 extern uint32_t click_config_generation;
 static int clickfs_ready;
 
@@ -62,81 +56,43 @@ static int clickfs_ready;
 #define SPIN_LOCK(l, file, line)	do { SPIN_LOCK_MSG((l), (file), (line), "lock"); mutex_lock((l)); } while (0)
 #define SPIN_UNLOCK(l, file, line)	do { SPIN_LOCK_MSG((l), (file), (line), "unlock"); mutex_unlock((l)); } while (0)
 
-#define LOCK_CONFIG_READ()	lock_config(__FILE__, __LINE__, 0)
-#define UNLOCK_CONFIG_READ()	unlock_config_read()
-#define LOCK_CONFIG_WRITE()	lock_config(__FILE__, __LINE__, 1)
-#define UNLOCK_CONFIG_WRITE()	unlock_config_write(__FILE__, __LINE__)
+#define LOCK_CONFIG()		lock_config(__FILE__, __LINE__)
+#define UNLOCK_CONFIG(...)	unlock_config(__FILE__, __LINE__, ## __VA_ARGS__)
+#define DOWNGRADE_CONFIG_LOCK(r) downgrade_config_lock(__FILE__, __LINE__, r)
 
 
 /*************************** Config locking *********************************/
 
 extern struct task_struct *clickfs_task;
 
-static inline void
-lock_config(const char *file, int line, int iswrite)
+static inline Router*
+lock_config(const char* file, int line)
 {
-    wait_queue_t wait;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
-# define private linux_private
-    init_wait(&wait);
-# undef private
-#else
-    init_waitqueue_entry(&wait, current);
-    add_wait_queue(&clickfs_waitq, &wait);
-#endif
-    for (;;) {
-	SPIN_LOCK(&clickfs_lock, file, line);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
-	prepare_to_wait(&clickfs_waitq, &wait, TASK_UNINTERRUPTIBLE);
-#else
-	set_current_state(TASK_UNINTERRUPTIBLE);
-#endif
-	int reads = atomic_read(&clickfs_read_count);
-	if (iswrite ? reads == 0 : reads >= 0)
-	    break;
-	SPIN_UNLOCK(&clickfs_lock, file, line);
-	schedule();
-    }
-    if (iswrite)
-	atomic_dec(&clickfs_read_count);
+    SPIN_LOCK(&clickfs_lock, file, line);
+    return 0;
+}
+
+static inline void
+unlock_config(const char* file, int line, Router* read_locked_router = 0)
+{
+    if (read_locked_router)
+        read_locked_router->unuse();
     else
-	atomic_inc(&clickfs_read_count);
+        SPIN_UNLOCK(&clickfs_lock, file, line);
+}
+
+static inline Router*
+downgrade_config_lock(const char* file, int line, Router* router)
+{
+    router->use();
     SPIN_UNLOCK(&clickfs_lock, file, line);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
-    finish_wait(&clickfs_waitq, &wait);
-#else
-    __set_current_state(TASK_RUNNING);
-    remove_wait_queue(&clickfs_waitq, &wait);
-#endif
-    clickfs_task = current;
-}
-
-static inline void
-unlock_config_read()
-{
-    assert(atomic_read(&clickfs_read_count) > 0);
-    clickfs_task = 0;
-    atomic_dec(&clickfs_read_count);
-    wake_up(&clickfs_waitq);
-}
-
-static inline void
-unlock_config_write(const char *file, int line)
-{
-    assert(atomic_read(&clickfs_read_count) == -1);
-    clickfs_task = 0;
-    atomic_inc(&clickfs_read_count);
-    wake_up_all(&clickfs_waitq);
+    return router;
 }
 
 
 /*************************** Inode constants ********************************/
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 19)
 #define INODE_INFO(inode)		(*((ClickInodeInfo *)(&(inode)->i_private)))
-#else
-#define INODE_INFO(inode)		(*((ClickInodeInfo *)(&(inode)->u)))
-#endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 2, 0)
 #define set_nlink(inode, nlink)		((inode)->i_nlink = (nlink))
 #endif
@@ -147,19 +103,16 @@ struct ClickInodeInfo {
 
 static ClickIno click_ino;
 
-// Must be called with LOCK_CONFIG_READ.
+// Must be called with LOCK_CONFIG held (& not downgraded).
 
 static int click_ino_check() {
     int r = 0;
-    if (click_ino.generation() != click_config_generation) {
-        SPIN_LOCK(&click_ino_lock, __FILE__, __LINE__);
+    if (click_ino.generation() != click_config_generation)
         r = click_ino.prepare(click_router, click_config_generation);
-        SPIN_UNLOCK(&click_ino_lock, __FILE__, __LINE__);
-    }
     return r;
 }
 
-// Must be called with LOCK_CONFIG_READ.
+// Must be called with LOCK_CONFIG held (& not downgraded).
 // Return "subdir_error" if this subdirectory was configuration-specific and
 // the configuration was changed.  Otherwise, updates this directory's link
 // count (if the configuration was changed) and returns 0.
@@ -187,7 +140,7 @@ static int click_ino_check(struct inode *inode, int subdir_error) {
 static struct inode *
 click_inode(struct super_block *sb, ino_t ino)
 {
-    // Must be called with click_config_lock held.
+    // Must be called with clickfs_lock held.
 
     if (click_ino_check() < 0)
 	return 0;
@@ -202,7 +155,11 @@ click_inode(struct super_block *sb, ino_t ino)
     if (click_ino.is_handler(ino)) {
 	int hi = click_ino.ino_handler(ino);
 	if (const Handler *h = Router::handler(click_router, hi)) {
-	    inode->i_mode = S_IFREG | (h->read_visible() ? click_fsmode.read : 0) | (h->write_visible() ? click_fsmode.write : 0);
+	    inode->i_mode = S_IFREG;
+            if (h->read_visible())
+                inode->i_mode |= click_fsmode.read;
+            if (h->write_visible() || (h->read_visible() && h->read_param()))
+                inode->i_mode |= click_fsmode.write;
 	    inode->i_uid = click_fsmode.uid;
 	    inode->i_gid = click_fsmode.gid;
 	    inode->i_op = click_handler_inode_ops;
@@ -238,13 +195,11 @@ extern "C" {
 static struct dentry *
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
 click_dir_lookup(struct inode *dir, struct dentry *dentry, unsigned)
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
-click_dir_lookup(struct inode *dir, struct dentry *dentry, struct nameidata *)
 #else
-click_dir_lookup(struct inode *dir, struct dentry *dentry)
+click_dir_lookup(struct inode *dir, struct dentry *dentry, struct nameidata *)
 #endif
 {
-    LOCK_CONFIG_READ();
+    LOCK_CONFIG();
     MDEBUG("click_dir_lookup %lx", dir->i_ino);
 
     struct inode *inode = 0;
@@ -260,7 +215,7 @@ click_dir_lookup(struct inode *dir, struct dentry *dentry)
 	    error = -ENOENT;
     }
 
-    UNLOCK_CONFIG_READ();
+    UNLOCK_CONFIG();
     if (error < 0)
 	return reinterpret_cast<struct dentry *>(ERR_PTR(error));
     else if (!inode)
@@ -275,7 +230,6 @@ click_dir_lookup(struct inode *dir, struct dentry *dentry)
     }
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
 static int
 click_dentry_revalidate(struct dentry *dentry, unsigned flags)
 {
@@ -287,7 +241,7 @@ click_dentry_revalidate(struct dentry *dentry, unsigned flags)
     if (INODE_INFO(inode).config_generation == click_config_generation)
 	return 1;
 
-    LOCK_CONFIG_READ();
+    LOCK_CONFIG();
     if (click_ino.has_element(inode->i_ino)) { // not a global directory
 	shrink_dcache_parent(dentry);
 	d_drop(dentry);
@@ -299,41 +253,65 @@ click_dentry_revalidate(struct dentry *dentry, unsigned flags)
 # endif
     else if ((r = click_ino_check(inode, -EIO)) == 0)
         r = 1;
-    UNLOCK_CONFIG_READ();
+    UNLOCK_CONFIG();
     return r;
 }
 
-# if LINUX_VERSION_CODE < KERNEL_VERSION(3, 8, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 8, 0)
 static int
 click_dentry_revalidate_nd(struct dentry *dentry, struct nameidata *nd)
 {
     return click_dentry_revalidate(dentry, nd->flags);
 }
-# endif
-#else
-static int
-click_dir_revalidate(struct dentry *dentry)
-{
-    struct inode *inode = dentry->d_inode;
-    MDEBUG("click_dir_revalidate %lx", (inode ? inode->i_ino : 0));
-    if (!inode)
-	return -EINVAL;
-
-    LOCK_CONFIG_READ();
-    int error = click_ino_check(inode, -EIO);
-    UNLOCK_CONFIG_READ();
-    return error;
-}
 #endif
 
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0)
+static bool
+my_filldir(const char *name, int namelen, ino_t ino, int dirtype, loff_t f_pos, void *thunk)
+{
+    struct dir_context* ctx = (struct dir_context*) thunk;
+    return dir_emit(ctx, name, namelen, ino, dirtype);
+}
+
+static int
+click_dir_iterate(struct file *filp, struct dir_context* ctx)
+{
+    struct inode *inode = filp->f_dentry->d_inode;
+    ino_t ino = inode->i_ino;
+    MDEBUG("click_dir_readdir %lx", ino);
+
+    LOCK_CONFIG();
+
+    int error = click_ino_check(inode, -ENOENT);
+    int stored = 0;
+    if (error < 0)
+	goto done;
+
+    // global '..'
+    if (ino == ClickIno::ino_globaldir && ctx->pos == 0) {
+	if (!my_filldir("..", 2, parent_ino(filp->f_dentry), ctx->pos, DT_DIR, ctx))
+	    goto done;
+        ctx->pos = 1;
+	stored++;
+    }
+
+    // real entries
+    stored += click_ino.readdir(ino, ctx->pos, my_filldir, ctx);
+
+  done:
+    UNLOCK_CONFIG();
+    return (error ? error : stored);
+}
+
+#else
 struct my_filldir_container {
     filldir_t filldir;
     void *dirent;
 };
 
 static bool
-my_filldir(const char *name, int namelen, ino_t ino, int dirtype, uint32_t f_pos, void *thunk)
+my_filldir(const char *name, int namelen, ino_t ino, int dirtype, loff_t f_pos, void *thunk)
 {
     my_filldir_container *mfd = (my_filldir_container *)thunk;
     int error = mfd->filldir(mfd->dirent, name, namelen, f_pos, ino, dirtype);
@@ -349,10 +327,10 @@ click_dir_readdir(struct file *filp, void *dirent, filldir_t filldir)
 
     struct inode *inode = filp->f_dentry->d_inode;
     ino_t ino = inode->i_ino;
-    uint32_t f_pos = filp->f_pos;
+    loff_t f_pos = filp->f_pos;
     MDEBUG("click_dir_readdir %lx", ino);
 
-    LOCK_CONFIG_READ();
+    LOCK_CONFIG();
 
     int error = click_ino_check(inode, -ENOENT);
     int stored = 0;
@@ -371,14 +349,11 @@ click_dir_readdir(struct file *filp, void *dirent, filldir_t filldir)
     stored += click_ino.readdir(ino, f_pos, my_filldir, &mfd);
 
   done:
-    UNLOCK_CONFIG_READ();
+    UNLOCK_CONFIG();
     filp->f_pos = f_pos;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
     return (error ? error : stored);
-#else
-    return error;
-#endif
 }
+#endif
 
 } // extern "C"
 
@@ -404,9 +379,9 @@ click_read_super(struct super_block *sb, void * /* data */, int)
     sb->s_d_op = &click_dentry_ops;
 #endif
     MDEBUG("click_config_lock");
-    LOCK_CONFIG_READ();
+    LOCK_CONFIG();
     root_inode = click_inode(sb, ClickIno::ino_globaldir);
-    UNLOCK_CONFIG_READ();
+    UNLOCK_CONFIG();
     if (!root_inode)
 	goto out_no_root;
 #if HAVE_LINUX_D_MAKE_ROOT
@@ -432,32 +407,30 @@ click_read_super(struct super_block *sb, void * /* data */, int)
     return 0;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
 static int
 click_fill_super(struct super_block *sb, void *data, int flags)
 {
     return click_read_super(sb, data, flags) ? 0 : -ENOMEM;
 }
 
-# if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0)
 static struct dentry *
 click_get_sb(struct file_system_type *fs_type, int flags, const char *, void *data)
 {
     return mount_single(fs_type, flags, data, click_fill_super);
 }
-# elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 18)
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 18)
 static int
 click_get_sb(struct file_system_type *fs_type, int flags, const char *, void *data, struct vfsmount *vfsmount)
 {
     return get_sb_single(fs_type, flags, data, click_fill_super, vfsmount);
 }
-# else
+#else
 static struct super_block *
 click_get_sb(struct file_system_type *fs_type, int flags, const char *, void *data)
 {
     return get_sb_single(fs_type, flags, data, click_fill_super);
 }
-# endif
 #endif
 
 static void
@@ -468,9 +441,9 @@ click_reread_super(struct super_block *sb)
 #endif
     if (sb->s_root) {
 	struct inode *old_inode = sb->s_root->d_inode;
-	LOCK_CONFIG_READ();
+	LOCK_CONFIG();
 	sb->s_root->d_inode = click_inode(sb, ClickIno::ino_globaldir);
-	UNLOCK_CONFIG_READ();
+	UNLOCK_CONFIG();
 	iput(old_inode);
 	sb->s_blocksize = 1024;
 	sb->s_blocksize_bits = 10;
@@ -504,6 +477,14 @@ click_delete_dentry(struct dentry *)
 
 /*************************** Handler operations ******************************/
 
+// see static_assert below
+#define HS_ALIVE		1
+#define HS_READING		2
+#define HS_DONE			4
+#define HS_RAW			8
+#define HS_DIRECT		HANDLER_DIRECT
+#define HS_WRITE_UNLIMITED	HANDLER_WRITE_UNLIMITED
+
 struct HandlerString {
     String data;
     int flags;                  // 0 means free
@@ -535,7 +516,8 @@ static HandlerString* alloc_handler_string(const Handler* h) {
             hs = new HandlerString;
         if (hs) {
             handler_strings->push_back(hs);
-            hs->flags = h->flags();
+            hs->flags = HS_ALIVE
+                | (h->flags() & (HS_WRITE_UNLIMITED | HS_DIRECT));
         }
     }
     SPIN_UNLOCK(&handler_strings_lock, __FILE__, __LINE__);
@@ -553,6 +535,27 @@ static void free_handler_string(HandlerString* hs) {
     } else
         delete hs;
     SPIN_UNLOCK(&handler_strings_lock, __FILE__, __LINE__);
+}
+
+static inline void handler_string_add_newline(HandlerString* hs,
+                                              const Handler* h) {
+    if (!h->raw()
+        && !(hs->flags & HS_RAW)
+        && !(hs->flags & HS_DIRECT)
+        && hs->data
+        && hs->data.back() != '\n')
+        hs->data += '\n';
+}
+
+static inline String handler_string_strip_newline(const HandlerString* hs,
+                                                  const Handler* h) {
+    if (!h->raw()
+        && !(hs->flags & HS_RAW)
+        && hs->data
+        && hs->data.back() == '\n')
+        return hs->data.substring(hs->data.begin(), hs->data.end() - 1);
+    else
+        return hs->data;
 }
 
 static void
@@ -586,32 +589,32 @@ extern "C" {
 static int
 handler_open(struct inode *inode, struct file *filp)
 {
-    LOCK_CONFIG_READ();
+    LOCK_CONFIG();
 
-    bool reading = (filp->f_flags & O_ACCMODE) != O_WRONLY;
-    bool writing = (filp->f_flags & O_ACCMODE) != O_RDONLY;
+    bool reading = (filp->f_mode & FMODE_READ) != 0;
+    bool writing = (filp->f_mode & FMODE_WRITE) != 0;
 
     int retval = 0;
     HandlerString* hs = 0;
     const Handler *h;
 
-    if ((reading && writing)
-	|| (filp->f_flags & O_APPEND)
-	|| (writing && !(filp->f_flags & O_TRUNC)))
+    if ((filp->f_flags & O_APPEND)
+	|| (!reading && writing && !(filp->f_flags & O_TRUNC)))
 	retval = -EACCES;
     else if ((retval = click_ino_check(inode, -EIO)) < 0)
 	/* save retval */;
     else if (!(h = Router::handler(click_router, click_ino.ino_handler(inode->i_ino))))
 	retval = -EIO;
-    else if ((reading && !h->read_visible())
-	     || (writing && !h->write_visible()))
+    else if (reading && writing && (h->flags() & HANDLER_DIRECT))
+        retval = -EACCES;
+    else if (reading ? !h->read_visible() : !h->write_visible())
 	retval = -EPERM;
     else if (!(hs = alloc_handler_string(h)))
 	retval = -ENOMEM;
     else
 	retval = 0;
 
-    UNLOCK_CONFIG_READ();
+    UNLOCK_CONFIG();
 
     if (retval < 0 && hs) {
 	free_handler_string(hs);
@@ -622,61 +625,114 @@ handler_open(struct inode *inode, struct file *filp)
 }
 
 static ssize_t
+handler_prepare_read(HandlerString* hs, struct file* filp,
+                     char* buffer, size_t count, loff_t* store_f_pos)
+{
+    Router* locktype = LOCK_CONFIG();
+    ssize_t retval;
+    const Handler *h;
+    struct inode *inode = filp->f_dentry->d_inode;
+    if ((retval = click_ino_check(inode, -EIO)) < 0)
+        /* save retval */;
+    else if (!(h = Router::handler(click_router, click_ino.ino_handler(inode->i_ino))))
+        retval = -EIO;
+    else if (!h->read_visible())
+        retval = -EPERM;
+    else {
+        int eindex = click_ino.ino_element(inode->i_ino);
+        Element *e = Router::element(click_router, eindex);
+
+        if (h->allow_concurrent_handlers())
+            locktype = DOWNGRADE_CONFIG_LOCK(e->router());
+
+        if ((hs->flags & HS_DIRECT) && buffer) {
+            click_handler_direct_info hdi;
+            hdi.buffer = buffer;
+            hdi.count = count;
+            hdi.store_f_pos = store_f_pos;
+            hdi.string = &hs->data;
+            hdi.retval = 0;
+            (void) h->__call_read(e, &hdi);
+            count = hdi.count;
+            retval = hdi.retval;
+        } else if (hs->flags & HS_DIRECT)
+            retval = -EINVAL;
+        else {
+            String param;
+            if ((filp->f_mode & FMODE_READ) && (filp->f_mode & FMODE_WRITE))
+                param = handler_string_strip_newline(hs, h);
+            if (!h->allow_concurrent_threads()) {
+                lock_threads();
+                hs->data = h->call_read(e, param, 0);
+                unlock_threads();
+            } else
+                hs->data = h->call_read(e, param, 0);
+            handler_string_add_newline(hs, h);
+            retval = (hs->data.out_of_memory() ? -ENOMEM : 0);
+        }
+    }
+    UNLOCK_CONFIG(locktype);
+    if (retval >= 0)
+        hs->flags |= HS_DONE;
+    return retval;
+}
+
+static loff_t
+handler_llseek(struct file* filp, loff_t offset, int origin)
+{
+    HandlerString* hs = FILP_HS(filp);
+    if (!hs)
+        return -EIO;
+
+    if ((filp->f_mode & FMODE_READ) && (filp->f_mode & FMODE_WRITE))
+        return -ESPIPE;
+
+    if (origin == SEEK_END) {
+        // ensure the string's existence before seeking
+        if ((filp->f_mode & FMODE_READ)
+            && (hs->flags & (HS_DIRECT | HS_DONE)) != HS_DONE) {
+            ssize_t r = handler_prepare_read(hs, filp, 0, 0, 0);
+            if (r < 0)
+                return r;
+        }
+        offset += hs->data.length();
+    } else if (origin == SEEK_CUR)
+        offset += filp->f_pos;
+
+    if (offset >= 0 && offset <= 0x7FFFFFFF) {
+        if (offset != filp->f_pos) {
+            filp->f_pos = offset;
+            filp->f_version = 0;
+        }
+        return offset;
+    } else
+        return -EINVAL;
+}
+
+static ssize_t
 handler_read(struct file *filp, char *buffer, size_t count, loff_t *store_f_pos)
 {
     loff_t f_pos = *store_f_pos;
+    ssize_t r = -EIO;
     HandlerString* hs = FILP_READ_HS(filp);
     if (!hs)
-	return -EIO;
+	return r;
 
-    // (re)read handler if necessary
-    if ((hs->flags & (HANDLER_DIRECT | HANDLER_DONE)) != HANDLER_DONE) {
-	LOCK_CONFIG_READ();
-	int retval;
-	const Handler *h;
-	struct inode *inode = filp->f_dentry->d_inode;
-	if ((retval = click_ino_check(inode, -EIO)) < 0)
-	    /* save retval */;
-	else if (!(h = Router::handler(click_router, click_ino.ino_handler(inode->i_ino))))
-	    retval = -EIO;
-	else if (!h->read_visible())
-	    retval = -EPERM;
-	else {
-	    int eindex = click_ino.ino_element(inode->i_ino);
-	    Element *e = Router::element(click_router, eindex);
-
-	    if (hs->flags & HANDLER_DIRECT) {
-		click_handler_direct_info hdi;
-		hdi.buffer = buffer;
-		hdi.count = count;
-		hdi.store_f_pos = store_f_pos;
-		hdi.string = &hs->data;
-		hdi.retval = 0;
-		(void) h->__call_read(e, &hdi);
-		count = hdi.count;
-		retval = hdi.retval;
-	    } else if (h->exclusive()) {
-		lock_threads();
-		hs->data = h->call_read(e);
-		unlock_threads();
-	    } else
-		hs->data = h->call_read(e);
-
-	    if (!h->raw()
-		&& !(hs->flags & HANDLER_RAW)
-		&& !(hs->flags & HANDLER_DIRECT)
-		&& hs->data
-		&& hs->data.back() != '\n')
-		hs->data += '\n';
-	    retval = (hs->data.out_of_memory() ? -ENOMEM : 0);
-	}
-	UNLOCK_CONFIG_READ();
-	if (retval < 0)
-	    return retval;
-	hs->flags |= HANDLER_DONE;
+    // read-write handler: reset file position if switching to reading
+    if ((filp->f_mode & FMODE_READ) && (filp->f_mode & FMODE_WRITE)
+        && !(hs->flags & HS_READING)) {
+        f_pos = 0;
+        hs->flags |= HS_READING;
     }
 
-    if (!(hs->flags & HANDLER_DIRECT)) {
+    // (re)read handler if necessary
+    if ((hs->flags & (HS_DIRECT | HS_DONE)) != HS_DONE) {
+        r = handler_prepare_read(hs, filp, buffer, count, store_f_pos);
+        if (r < 0)
+            return r;
+    }
+
+    if (!(hs->flags & HS_DIRECT)) {
 	const String &s = hs->data;
 	if (f_pos > s.length())
 	    f_pos = s.length();
@@ -684,10 +740,11 @@ handler_read(struct file *filp, char *buffer, size_t count, loff_t *store_f_pos)
 	    count = s.length() - f_pos;
 	if (copy_to_user(buffer, s.data() + f_pos, count) > 0)
 	    return -EFAULT;
+        *store_f_pos = f_pos + count;
+        r = count;
     }
 
-    *store_f_pos += count;
-    return count;
+    return r;
 }
 
 static ssize_t
@@ -700,12 +757,18 @@ handler_write(struct file *filp, const char *buffer, size_t count, loff_t *store
     String &s = hs->data;
     int old_length = s.length();
 
-    hs->flags &= ~HANDLER_DONE;
+    hs->flags &= ~HS_DONE;
 #ifdef LARGEST_HANDLER_WRITE
     if (f_pos + count > LARGEST_HANDLER_WRITE
-	&& !(hs->flags & HANDLER_WRITE_UNLIMITED))
+	&& !(hs->flags & HS_WRITE_UNLIMITED))
 	return -EFBIG;
 #endif
+    // read-write handler: reset file position if switching to writing
+    if ((filp->f_mode & FMODE_READ) && (filp->f_mode & FMODE_WRITE)
+        && (hs->flags & HS_READING)) {
+        f_pos = 0;
+        hs->flags &= ~HS_READING;
+    }
 
     if (f_pos + count > old_length) {
 	s.append_fill(0, f_pos + count - old_length);
@@ -726,13 +789,14 @@ handler_write(struct file *filp, const char *buffer, size_t count, loff_t *store
     if (copy_from_user(data + f_pos, buffer, count) > 0)
 	return -EFAULT;
 
-    *store_f_pos += count;
+    *store_f_pos = f_pos + count;
     return count;
 }
 
 static int
 handler_do_write(struct file *filp, void *address_ptr)
 {
+    Router* locktype = LOCK_CONFIG();
     HandlerString* hs = FILP_WRITE_HS(filp);
     struct inode *inode = filp->f_dentry->d_inode;
     const Handler *h;
@@ -748,6 +812,10 @@ handler_do_write(struct file *filp, void *address_ptr)
     else {
 	int eindex = click_ino.ino_element(inode->i_ino);
 	Element *e = Router::element(click_router, eindex);
+
+        if (h->allow_concurrent_handlers())
+            locktype = DOWNGRADE_CONFIG_LOCK(e->router());
+
 	click_llrpc_call_handler_st chs;
 	chs.flags = 0;
 	int r;
@@ -758,23 +826,21 @@ handler_do_write(struct file *filp, void *address_ptr)
 	    goto exit;
 	}
 
-	String data = hs->data;
-	if (!h->raw()
-	    && !(hs->flags & HANDLER_RAW)
-	    && (!address_ptr || !(chs.flags & CLICK_LLRPC_CALL_HANDLER_FLAG_RAW))
-	    && data
-	    && data.back() == '\n')
-	    data = data.substring(data.begin(), data.end() - 1);
+	String data;
+        if (!address_ptr || !(chs.flags & CLICK_LLRPC_CALL_HANDLER_FLAG_RAW))
+            data = handler_string_strip_newline(hs, h);
+        else
+            data = hs->data;
 
 	ClickfsHandlerErrorHandler cerrh;
-	if (h->exclusive()) {
+	if (!h->allow_concurrent_threads()) {
 	    lock_threads();
 	    retval = h->call_write(data, e, &cerrh);
 	    unlock_threads();
 	} else
 	    retval = h->call_write(data, e, &cerrh);
 
-	hs->flags |= HANDLER_DONE;
+	hs->flags |= HS_DONE;
 
 	if (cerrh._sa && !address_ptr) {
 	    ErrorHandler *errh = click_logged_errh;
@@ -819,6 +885,7 @@ handler_do_write(struct file *filp, void *address_ptr)
     }
 
   exit:
+    UNLOCK_CONFIG(locktype);
     return retval;
 }
 
@@ -829,7 +896,7 @@ handler_flush(struct file *filp
 #endif
 	      )
 {
-    bool writing = (filp->f_flags & O_ACCMODE) != O_RDONLY;
+    bool writing = (filp->f_mode & FMODE_WRITE) && !(filp->f_mode & FMODE_READ);
     HandlerString* hs = FILP_WRITE_HS(filp);
     int retval = 0;
 
@@ -839,12 +906,8 @@ handler_flush(struct file *filp
     int f_count = atomic_read(&filp->f_count);
 #endif
 
-    if (writing && f_count == 1 && hs
-	&& !(hs->flags & HANDLER_DONE)) {
-	LOCK_CONFIG_WRITE();
+    if (writing && f_count == 1 && hs && !(hs->flags & HS_DONE))
 	retval = handler_do_write(filp, 0);
-	UNLOCK_CONFIG_WRITE();
-    }
 
     return retval;
 }
@@ -863,10 +926,7 @@ static inline int
 do_handler_ioctl(struct inode *inode, struct file *filp,
 		 unsigned command, unsigned long address)
 {
-    if (command & _CLICK_IOC_SAFE)
-	LOCK_CONFIG_READ();
-    else
-	LOCK_CONFIG_WRITE();
+    Router* locktype = LOCK_CONFIG();
 
     int retval;
     Element *e;
@@ -880,16 +940,19 @@ do_handler_ioctl(struct inode *inode, struct file *filp,
     else if (command == CLICK_LLRPC_ABANDON_HANDLER) {
 	HandlerString* hs = FILP_HS(filp);
 	hs->data = String();
-	hs->flags |= HANDLER_DONE;
+	hs->flags |= HS_DONE;
 	retval = 0;
     } else if (command == CLICK_LLRPC_RAW_HANDLER) {
 	HandlerString* hs = FILP_HS(filp);
-	hs->flags |= HANDLER_RAW;
+	hs->flags |= HS_RAW;
 	retval = 0;
     } else if (click_ino.ino_element(inode->i_ino) < 0
                || !(e = click_router->element(click_ino.ino_element(inode->i_ino))))
 	retval = -EIO;
     else {
+        if (command & _CLICK_IOC_SAFE)
+            locktype = DOWNGRADE_CONFIG_LOCK(e->router());
+
 	union {
 	    char buf[128];
 	    long align;
@@ -913,8 +976,12 @@ do_handler_ioctl(struct inode *inode, struct file *filp,
 	    goto free_exit;
 
 	// call llrpc
-	arg_ptr = (size && (command & (_CLICK_IOC_IN | _CLICK_IOC_OUT)) ? data : address_ptr);
-	if (click_router->initialized())
+        if (size && (command & (_CLICK_IOC_IN | _CLICK_IOC_OUT)))
+            arg_ptr = data;
+        else
+            arg_ptr = address_ptr;
+
+	if (e->router()->initialized())
 	    retval = e->llrpc(command, arg_ptr);
 	else
 	    retval = e->Element::llrpc(command, arg_ptr);
@@ -929,10 +996,7 @@ do_handler_ioctl(struct inode *inode, struct file *filp,
     }
 
   exit:
-    if (command & _CLICK_IOC_SAFE)
-	UNLOCK_CONFIG_READ();
-    else
-	UNLOCK_CONFIG_WRITE();
+    UNLOCK_CONFIG(locktype);
     return retval;
 }
 
@@ -968,15 +1032,8 @@ read_ino_info(Element *, void *)
 struct file_operations *
 click_new_file_operations()
 {
-    if (!clickfs) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
+    if (!clickfs)
 	clickfs = proclikefs_register_filesystem("click", 0, click_get_sb);
-#else
-	// NB: remove FS_SINGLE if it will ever make sense to have different
-	// Click superblocks -- if we introduce mount options, for example
-	clickfs = proclikefs_register_filesystem("click", FS_SINGLE, click_read_super);
-#endif
-    }
     if (clickfs)
 	return proclikefs_new_file_operations(clickfs);
     else
@@ -986,16 +1043,11 @@ click_new_file_operations()
 int
 init_clickfs()
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 0)
-    static_assert(sizeof(((struct inode *)0)->u) >= sizeof(ClickInodeInfo), "The file-system-specific data in struct inode isn't big enough.");
-#endif
-    static_assert(HANDLER_DIRECT + HANDLER_DONE + HANDLER_RAW + HANDLER_SPECIAL_INODE + HANDLER_WRITE_UNLIMITED < Handler::USER_FLAG_0, "Too few driver handler flags available.");
+    static_assert(HANDLER_DIRECT + HANDLER_WRITE_UNLIMITED < Handler::USER_FLAG_0, "Too few driver handler flags available.");
+    static_assert(((HS_DIRECT | HS_WRITE_UNLIMITED) & (HS_READING | HS_DONE | HS_RAW)) == 0, "Handler flag overlap.");
 
     mutex_init(&handler_strings_lock);
     mutex_init(&clickfs_lock);
-    mutex_init(&click_ino_lock);
-    init_waitqueue_head(&clickfs_waitq);
-    atomic_set(&clickfs_read_count, 0);
 
     // clickfs creation moved to click_new_file_operations()
     if (!(click_dir_file_ops = click_new_file_operations())
@@ -1006,26 +1058,25 @@ init_clickfs()
 	return -EINVAL;
     }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 0)
-    click_superblock_ops.put_inode = force_delete;
-#endif
     click_superblock_ops.put_super = proclikefs_put_super;
     // XXX statfs
 
     click_dentry_ops.d_delete = click_delete_dentry;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
     click_dentry_ops.d_revalidate = click_dentry_revalidate;
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
+#else
     click_dentry_ops.d_revalidate = click_dentry_revalidate_nd;
 #endif
 
     click_dir_file_ops->read = generic_read_dir;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0)
+    click_dir_file_ops->iterate = click_dir_iterate;
+#else
     click_dir_file_ops->readdir = click_dir_readdir;
-    click_dir_inode_ops->lookup = click_dir_lookup;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 0)
-    click_dir_inode_ops->revalidate = click_dir_revalidate;
 #endif
+    click_dir_inode_ops->lookup = click_dir_lookup;
 
+    click_handler_file_ops->llseek = handler_llseek;
     click_handler_file_ops->read = handler_read;
     click_handler_file_ops->write = handler_write;
 #if HAVE_UNLOCKED_IOCTL

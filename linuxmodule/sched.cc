@@ -38,30 +38,22 @@ CLICK_CXX_PROTECT
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <asm/bitops.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
-# include <linux/cpumask.h>
-#endif
+#include <linux/cpumask.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0)
 # include <linux/kthread.h>
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 9, 0)
+# include <linux/sched/rt.h>
 #endif
 CLICK_CXX_UNPROTECT
 #include <click/cxxunprotect.h>
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
-# define MIN_PRIO	MAX_RT_PRIO
+#define MIN_PRIO	MAX_RT_PRIO
 /* MAX_PRIO already defined */
-# define PRIO2NICE(p)	((p) - MIN_PRIO - 20)
-# define NICE2PRIO(n)	(MIN_PRIO + (n) + 20)
-# define DEF_PRIO	NICE2PRIO(0)
-# define TASK_PRIO(t)	((t)->static_prio)
-#else
-# define MIN_PRIO	(-20)
-# define MAX_PRIO	20
-# define PRIO2NICE(p)	(p)
-# define NICE2PRIO(n)	(n)
-# define DEF_PRIO	DEF_NICE
-# define TASK_PRIO(t)	((t)->nice)
-#endif
+#define PRIO2NICE(p)	((p) - MIN_PRIO - 20)
+#define NICE2PRIO(n)	(MIN_PRIO + (n) + 20)
+#define DEF_PRIO	NICE2PRIO(0)
+#define TASK_PRIO(t)	((t)->static_prio)
 
 #define SOFT_SPIN_LOCK(l)	do { /*MDEBUG("soft_lock %s", #l);*/ soft_spin_lock((l)); } while (0)
 #define SPIN_UNLOCK(l)		do { /*MDEBUG("unlock %s", #l);*/ spin_unlock((l)); } while (0)
@@ -87,11 +79,8 @@ click_sched(void *thunk)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 8, 0)
     /* daemonize seems to be unnecessary */
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
-    daemonize("kclick");
 #else
-    daemonize();
-    strcpy(current->comm, "kclick");
+    daemonize("kclick");
 #endif
 
     TASK_PRIO(current) = click_thread_priority;
@@ -105,21 +94,14 @@ click_sched(void *thunk)
     int mycpu = click_parm(CLICKPARM_CPU);
     if (mycpu >= 0) {
 	mycpu += rt->thread_id();
-# if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 0)
 	if (mycpu < num_possible_cpus() && cpu_online(mycpu)) {
-#  if CONFIG_CPUMASK_OFFSTACK
+# if CONFIG_CPUMASK_OFFSTACK
 	    set_cpus_allowed_ptr(current, cpumask_of(mycpu));
-#  else
+# else
 	    set_cpus_allowed(current, cpumask_of_cpu(mycpu));
-#  endif
+# endif
 	} else
 	    printk(KERN_WARNING "click: warning: cpu %d for thread %d offline\n", mycpu, rt->thread_id());
-# elif LINUX_VERSION_CODE >= KERNEL_VERSION(2, 4, 21)
-	if (mycpu < smp_num_cpus && (cpu_online_map & (1UL << cpu_logical_map(mycpu))))
-	    set_cpus_allowed(current, 1UL << cpu_logical_map(mycpu));
-	else
-	    printk(KERN_WARNING "click: warning: cpu %d for thread %d offline\n", mycpu, rt->thread_id());
-# endif
     }
 #endif
 
@@ -242,23 +224,20 @@ read_master_info(Element *, void *)
 #if HAVE_ADAPTIVE_SCHEDULER
 
 static String
-read_cpu_share(Element *, void *thunk)
+read_cpu_share(Element*, void* user_data)
 {
-    int val = (thunk ? max_click_frac : min_click_frac);
+    int val = (user_data ? max_click_frac : min_click_frac);
     return cp_unparse_real10(val, 3);
 }
 
 static String
-read_cur_cpu_share(Element *, void *)
+read_cur_cpu_share(Element*, void *)
 {
-    if (click_router) {
-	StringAccum sa;
-	for (int i = 0; i < click_master->nthreads(); i++)
-	    sa << cp_unparse_real10(click_master->thread(i)->cur_cpu_share(), 3)
-	       << '\n';
-	return sa.take_string();
-    } else
-	return "0\n";
+    StringAccum sa;
+    for (int i = 0; i < click_master->nthreads(); i++)
+        sa << cp_unparse_real10(click_master->thread(i)->cur_cpu_share(), 3)
+           << '\n';
+    return sa.take_string();
 }
 
 static int
@@ -397,13 +376,13 @@ click_init_sched(ErrorHandler *errh)
 
     Router::add_read_handler(0, "threads", read_threads, 0);
     Router::add_read_handler(0, "priority", read_priority, 0);
-    Router::add_write_handler(0, "priority", write_priority, 0, Handler::NONEXCLUSIVE);
+    Router::add_write_handler(0, "priority", write_priority, 0, Handler::h_nonexclusive);
 #if HAVE_ADAPTIVE_SCHEDULER
     static_assert(Task::MAX_UTILIZATION == 1000, "The adaptive scheduler requires Task::MAX_UTILIZATION == 1000.");
     Router::add_read_handler(0, "min_cpu_share", read_cpu_share, 0);
-    Router::add_write_handler(0, "min_cpu_share", write_cpu_share, 0, Handler::NONEXCLUSIVE);
+    Router::add_write_handler(0, "min_cpu_share", write_cpu_share, 0, Handler::h_nonexclusive);
     Router::add_read_handler(0, "max_cpu_share", read_cpu_share, (void *)1);
-    Router::add_write_handler(0, "max_cpu_share", write_cpu_share, (void *)1, Handler::NONEXCLUSIVE);
+    Router::add_write_handler(0, "max_cpu_share", write_cpu_share, (void *)1, Handler::h_nonexclusive);
     Router::add_read_handler(0, "cpu_share", read_cur_cpu_share, 0);
 #else
     Router::add_read_handler(0, "tasks_per_iter", read_sched_param,
@@ -415,11 +394,11 @@ click_init_sched(ErrorHandler *errh)
 
     // XXX believed to be OK to run in parallel with thread processing
     Router::add_write_handler(0, "tasks_per_iter", write_sched_param,
-			      (void *)H_TASKS_PER_ITER, Handler::NONEXCLUSIVE);
+			      (void *)H_TASKS_PER_ITER, Handler::h_nonexclusive);
     Router::add_write_handler(0, "iters_per_timers", write_sched_param,
-			      (void *)H_ITERS_PER_TIMERS, Handler::NONEXCLUSIVE);
+			      (void *)H_ITERS_PER_TIMERS, Handler::h_nonexclusive);
     Router::add_write_handler(0, "iters_per_os", write_sched_param,
-			      (void *)H_ITERS_PER_OS, Handler::NONEXCLUSIVE);
+			      (void *)H_ITERS_PER_OS, Handler::h_nonexclusive);
 
 #endif
 #if CLICK_DEBUG_MASTER
